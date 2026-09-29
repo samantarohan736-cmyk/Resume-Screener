@@ -1,4 +1,4 @@
-<p align="center">
+<!-- <p align="center">
   <img src="assets/banner.png" alt="LifeBridge AI Banner" width="100%"/>
 </p>
 
@@ -70,7 +70,7 @@ Built under the **"Agents for Good"** track, this project aims to democratize ca
 - Live view of the **40-student SQLite database** used to train the ML model
 - Searchable and filterable data table
 - Aggregate statistics: total profiles, average LPA, top role, highest package
-- Visual explanation of the Random Forest decision pipeline
+- Visual explanation of the Random Forest decision pipeline -->
 
 ---
 
@@ -91,7 +91,7 @@ Built under the **"Agents for Good"** track, this project aims to democratize ca
 ## 📂 Project Structure
 
 ```
-LifeBridge-AI/
+Resume-Screener/
 ├── assets/                     # Banner and preview images
 ├── .github/
 │   └── workflows/
