@@ -131,7 +131,7 @@ Resume-Screener/
 
 #### 1. Clone the Repository
 ```bash
-git clone https://github.com/ponnadabhanuprakash/LifeBridge-AI.git
+git clone https://github.com/samantarohan736-cmyk/Resume-Screener.git
 cd LifeBridge-AI
 ```
 
