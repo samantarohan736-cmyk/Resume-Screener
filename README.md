@@ -132,7 +132,7 @@ Resume-Screener/
 #### 1. Clone the Repository
 ```bash
 git clone https://github.com/samantarohan736-cmyk/Resume-Screener.git
-cd LifeBridge-AI
+cd Resume-Screener
 ```
 
 #### 2. Setup Backend (Python Flask + ML)
