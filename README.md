@@ -139,11 +139,14 @@ cd LifeBridge-AI
 ```bash
 # Create virtual environment
 cd backend
-python -m venv venv
+python -m venv venv 
 
 # Activate virtual environment
 # Windows:
-venv\Scripts\activate
+# venv\Scripts\activate or 
+
+# Enter into virtual enviroment: 
+.venv\Scripts\activate
 # macOS/Linux:
 source venv/bin/activate
 

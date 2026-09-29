@@ -1,6 +1,8 @@
 import sqlite3
 import re
 import os
+import io
+import PyPDF2
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ml_model import predict_career, train_models
@@ -314,15 +316,176 @@ def predict():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/analyze-resume", methods=["POST"])
-def analyze_resume():
-    data = request.get_json()
-    if not data or "resume_text" not in data:
-        return jsonify({"error": "No resume text provided"}), 400
-        
-    resume_text = data["resume_text"]
-    role = data.get("target_role", "Java Developer")
+def extract_text_from_pdf_file(pdf_file):
+    """
+    Robust multi-engine PDF text extraction pipeline:
+    1. PyMuPDF (pymupdf) - handles vector/form/complex layers & text blocks
+    2. pdfplumber - handles complex multi-column table layouts
+    3. pypdf - handles standard stream objects
+    4. pdfminer.six - high-level text stream parser
+    5. EasyOCR - for scanned image-only PDF resumes
+    """
+    try:
+        if hasattr(pdf_file, 'read'):
+            pdf_bytes = pdf_file.read()
+        elif isinstance(pdf_file, bytes):
+            pdf_bytes = pdf_file
+        else:
+            return ""
+    except Exception as e:
+        print(f"Error reading file bytes: {e}")
+        return ""
+
+    if not pdf_bytes:
+        return ""
+
+    extracted_text = ""
+
+    # Engine 1: PyMuPDF (pymupdf)
+    try:
+        import pymupdf
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        pages_text = []
+        for page in doc:
+            t = page.get_text()
+            if not t.strip():
+                blocks = page.get_text("blocks")
+                t = "\n".join([b[4] for b in blocks if len(b) >= 5 and b[4].strip()])
+            if t.strip():
+                pages_text.append(t.strip())
+        extracted_text = "\n".join(pages_text).strip()
+        if extracted_text:
+            return extracted_text
+    except Exception as e:
+        print(f"pymupdf extraction note: {e}")
+
+    # Engine 2: pdfplumber (best for compressed/encoded/layout PDFs)
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            pages_text = []
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    pages_text.append(t)
+            extracted_text = "\n".join(pages_text).strip()
+            if extracted_text:
+                return extracted_text
+    except Exception as e:
+        print(f"pdfplumber extraction note: {e}")
+
+    # Engine 3: pypdf / PyPDF2
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        pages_text = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                pages_text.append(t)
+        extracted_text = "\n".join(pages_text).strip()
+        if extracted_text:
+            return extracted_text
+    except Exception as e:
+        print(f"pypdf extraction note: {e}")
+
+    # Engine 4: pdfminer
+    try:
+        from pdfminer.high_level import extract_text as pdfminer_extract
+        extracted_text = pdfminer_extract(io.BytesIO(pdf_bytes)).strip()
+        if extracted_text:
+            return extracted_text
+    except Exception as e:
+        print(f"pdfminer extraction note: {e}")
+
+    # Engine 5: EasyOCR Fallback for image-only / scanned PDF resumes
+    try:
+        import pymupdf
+        import PIL.Image
+        import easyocr
+        reader = easyocr.Reader(['en'], gpu=False)
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        ocr_text_pages = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=150)
+            img = PIL.Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            results = reader.readtext(buf.getvalue(), detail=0)
+            if results:
+                ocr_text_pages.append(" ".join(results))
+        extracted_text = "\n".join(ocr_text_pages).strip()
+        if extracted_text:
+            return extracted_text
+    except Exception as ocr_e:
+        print(f"OCR fallback note: {ocr_e}")
+
+    return extracted_text
+
+def extract_candidate_name(text, filename=""):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if lines:
+        first_line = lines[0]
+        if len(first_line.split()) <= 4 and not re.search(r"resume|curriculum|cv|profile|summary|contact|education", first_line, re.IGNORECASE):
+            return first_line
+    if filename:
+        name_part = os.path.splitext(filename)[0]
+        name_part = re.sub(r"[_\-\.]", " ", name_part)
+        name_part = re.sub(r"\b(resume|cv|pdf)\b", "", name_part, flags=re.IGNORECASE).strip()
+        if name_part:
+            return name_part.title()
+    return "Candidate"
+
+def parse_resume_features(text):
+    text_lower = text.lower()
     
+    # CGPA extraction
+    cgpa_match = re.search(r"\b(?:cgpa|gpa|percentage|marks)[\s:]*([0-9]\.[0-9]{1,2}|10\.0|[0-9]{2}(?:\.[0-9]{1,2})?%?)", text_lower)
+    cgpa = 7.5
+    if cgpa_match:
+        val_str = cgpa_match.group(1).replace("%", "")
+        try:
+            val = float(val_str)
+            if val > 10.0:
+                val = val / 10.0
+            cgpa = min(10.0, max(4.0, val))
+        except ValueError:
+            pass
+            
+    def score_keywords(kw_list):
+        matches = sum(1 for kw in kw_list if re.search(r"\b" + re.escape(kw) + r"\b", text_lower))
+        return min(10, max(2, matches * 2 + 2)) if matches > 0 else 3
+        
+    java = score_keywords(["java", "spring", "spring boot", "hibernate", "maven", "jdk", "jvm", "j2ee"])
+    python = score_keywords(["python", "pandas", "numpy", "django", "flask", "fastapi", "scikit-learn", "tensorflow", "pytorch", "jupyter"])
+    web_dev = score_keywords(["html", "css", "javascript", "react", "node", "express", "angular", "vue", "tailwind", "bootstrap", "typescript"])
+    dsa = score_keywords(["dsa", "data structures", "algorithms", "leetcode", "competitive programming", "tree", "graph", "sorting", "dynamic programming"])
+    communication = score_keywords(["communication", "presentation", "verbal", "written", "fluent", "teamwork", "soft skills"])
+    leadership = score_keywords(["leadership", "lead", "manager", "head", "captain", "president", "organized", "coordinator", "managed"])
+    
+    proj_matches = len(re.findall(r"\b(project|projects)\b", text_lower))
+    projects = min(10, max(1, proj_matches))
+    
+    intern_matches = len(re.findall(r"\b(intern|internship|experience|work experience|employment)\b", text_lower))
+    internships = min(5, max(0, intern_matches // 2))
+    
+    cert_matches = len(re.findall(r"\b(certified|certification|certifications|course|completed|certificate)\b", text_lower))
+    certifications = min(5, max(0, cert_matches))
+
+    return {
+        "cgpa": cgpa,
+        "java": java,
+        "python": python,
+        "web_dev": web_dev,
+        "dsa": dsa,
+        "communication": communication,
+        "leadership": leadership,
+        "projects": projects,
+        "internships": internships,
+        "certifications": certifications
+    }
+
+def process_single_resume_analysis(resume_text, role="Java Developer", candidate_name=None, filename=None):
     # 1. Spelling and Typos scanning
     mistakes = []
     corrected_text = resume_text
@@ -342,21 +505,23 @@ def analyze_resume():
             # Perform drop-in replacements
             corrected_text = pattern.sub(correction, corrected_text)
             
-    # 2. Checklist of Sections
+    # 2. Checklist of Sections (Check against both original & corrected text)
     sections = {
-        "Contact Information": [r"contact", r"email", r"phone", r"address", r"github", r"linkedin"],
-        "Education": [r"education", r"degree", r"college", r"university", r"cgpa", r"btech", r"b\.tech"],
-        "Skills": [r"skills", r"technical skills", r"technologies", r"tools", r"languages"],
-        "Projects": [r"projects", r"academic projects", r"key projects", r"personal projects"],
-        "Experience": [r"experience", r"employment", r"internship", r"work experience", r"history"]
+        "Contact Information": [r"contact", r"email", r"phone", r"address", r"github", r"linkedin", r"mobile", r"mail"],
+        "Education": [r"education", r"degree", r"college", r"university", r"cgpa", r"btech", r"b\.tech", r"academic", r"qualification"],
+        "Skills": [r"skills", r"technical skills", r"technologies", r"tools", r"languages", r"expertise", r"competencies"],
+        "Projects": [r"projects", r"academic projects", r"key projects", r"personal projects", r"project"],
+        "Experience": [r"experience", r"employment", r"internship", r"work experience", r"history", r"work", r"experiance"]
     }
     
     section_check = {}
     present_sections = 0
+    search_corpus = resume_text + "\n" + corrected_text
+
     for section_name, keywords in sections.items():
         found = False
         for kw in keywords:
-            if re.search(r"\b" + kw + r"\b", resume_text, re.IGNORECASE):
+            if re.search(r"\b" + kw + r"\b", search_corpus, re.IGNORECASE):
                 found = True
                 break
         section_check[section_name] = found
@@ -365,9 +530,9 @@ def analyze_resume():
             
     # 3. Contact details regex extraction
     has_email = bool(re.search(r"[\w\.-]+@[\w\.-]+\.\w+", resume_text))
-    has_phone = bool(re.search(r"\b\d{10,12}\b|(?:\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b", resume_text))
-    has_github = "github.com" in resume_text.lower()
-    has_linkedin = "linkedin.com" in resume_text.lower()
+    has_phone = bool(re.search(r"\b\d{10,12}\b|(?:\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b|\b\d{5}[\s.-]?\d{5}\b", resume_text))
+    has_github = "github.com" in resume_text.lower() or "github:" in resume_text.lower() or "github" in resume_text.lower()
+    has_linkedin = "linkedin.com" in resume_text.lower() or "linkedin:" in resume_text.lower() or "linkedin" in resume_text.lower()
     
     contact_suggestions = []
     if not has_email:
@@ -379,7 +544,7 @@ def analyze_resume():
     if not has_linkedin:
         contact_suggestions.append("No LinkedIn profile link found. Crucial for professional networking.")
         
-    # 4. ATS Keyword Match based on target role
+    # 4. ATS Keyword Match based on target role with Synonym Aliases
     ats_keywords = {
         "Java Developer": ["java", "spring boot", "sql", "dsa", "hibernate", "rest api", "maven", "mysql", "microservices", "git"],
         "Full Stack Developer": ["html", "css", "javascript", "react", "node.js", "express", "mongodb", "git", "rest api", "sql"],
@@ -393,8 +558,34 @@ def analyze_resume():
     
     keywords = ats_keywords.get(role, ["git", "communication", "projects", "skills"])
     found_keywords = []
+    text_lower = resume_text.lower()
+
+    aliases = {
+        "dsa": ["dsa", "data structures", "algorithms"],
+        "rest api": ["rest api", "restful", "rest apis", "api"],
+        "node.js": ["node.js", "nodejs", "node"],
+        "react": ["react", "react.js", "reactjs"],
+        "spring boot": ["spring boot", "spring"],
+        "ci/cd": ["ci/cd", "ci-cd", "cicd"],
+        "c++": ["c++", "cpp"],
+        "power bi": ["power bi", "powerbi"],
+        "express": ["express", "express.js", "expressjs"]
+    }
+
     for kw in keywords:
-        if re.search(r"\b" + re.escape(kw) + r"\b", resume_text, re.IGNORECASE):
+        kw_lower = kw.lower()
+        search_terms = aliases.get(kw_lower, [kw_lower])
+        matched = False
+        for term in search_terms:
+            if re.search(r"[^a-zA-Z0-9_]", term):
+                if term in text_lower:
+                    matched = True
+                    break
+            else:
+                if re.search(r"\b" + re.escape(term) + r"\b", text_lower):
+                    matched = True
+                    break
+        if matched:
             found_keywords.append(kw)
             
     ats_score = int((len(found_keywords) / len(keywords)) * 100) if keywords else 0
@@ -422,15 +613,115 @@ def analyze_resume():
         
     if not improvements:
         improvements.append("Your resume looks stellar! Ensure your project summaries clearly highlight quantitative impact (e.g., 'Optimized database queries, reducing loading speed by 20%').")
-        
-    return jsonify({
+
+    # 6. ML Model Prediction
+    extracted_features = parse_resume_features(resume_text)
+    ml_prediction = None
+    try:
+        ml_prediction = predict_career(extracted_features)
+    except Exception as e:
+        print("ML model prediction error:", e)
+        ml_prediction = {
+            "recommended_role": role,
+            "package_lpa": 6.5
+        }
+
+    if not candidate_name:
+        candidate_name = extract_candidate_name(resume_text, filename or "")
+
+    return {
+        "candidate_name": candidate_name,
+        "filename": filename or "Uploaded_Resume",
+        "resume_text": resume_text,
         "overall_score": overall_score,
         "mistakes": mistakes,
         "section_check": section_check,
         "ats_score": ats_score,
         "missing_keywords": missing_keywords,
+        "found_keywords": found_keywords,
         "improvements": improvements,
-        "corrected_text": corrected_text
+        "corrected_text": corrected_text,
+        "ml_prediction": ml_prediction,
+        "extracted_features": extracted_features
+    }
+
+@app.route("/api/analyze-resume", methods=["POST"])
+def analyze_resume():
+    # 1. Handle JSON Text Payload
+    if request.is_json:
+        data = request.get_json() or {}
+        if "resume_text" not in data or not data["resume_text"].strip():
+            return jsonify({"error": "No resume text provided"}), 400
+            
+        resume_text = data["resume_text"]
+        role = data.get("target_role", "Java Developer")
+        result = process_single_resume_analysis(resume_text, role=role)
+        return jsonify(result)
+
+    # 2. Handle File Uploads (Single or Multiple PDF files)
+    files = request.files.getlist("resumes") or request.files.getlist("files") or request.files.getlist("file")
+    if not files and "resume" in request.files:
+        files = [request.files["resume"]]
+
+    if not files:
+        return jsonify({"error": "No resume file or text provided."}), 400
+
+    target_role = request.form.get("target_role", "Java Developer")
+    analyzed_candidates = []
+
+    for f in files:
+        if not f or not f.filename:
+            continue
+
+        filename = f.filename
+        if filename.lower().endswith(".pdf"):
+            raw_text = extract_text_from_pdf_file(f)
+        else:
+            try:
+                raw_text = f.read().decode("utf-8", errors="ignore")
+            except Exception:
+                raw_text = ""
+
+        if not raw_text.strip():
+            analyzed_candidates.append({
+                "candidate_name": extract_candidate_name("", filename),
+                "filename": filename,
+                "resume_text": "",
+                "overall_score": 0,
+                "mistakes": [],
+                "section_check": {"Contact Information": False, "Education": False, "Skills": False, "Projects": False, "Experience": False},
+                "ats_score": 0,
+                "missing_keywords": [],
+                "found_keywords": [],
+                "improvements": ["Unable to extract text from PDF. Please make sure the PDF contains selectable text (not scanned images)."],
+                "corrected_text": "",
+                "ml_prediction": {"recommended_role": target_role, "package_lpa": 0.0},
+                "extracted_features": {}
+            })
+            continue
+
+        candidate_result = process_single_resume_analysis(
+            raw_text,
+            role=target_role,
+            filename=filename
+        )
+        analyzed_candidates.append(candidate_result)
+
+    if not analyzed_candidates:
+        return jsonify({"error": "No valid PDF resume files found to analyze."}), 400
+
+    total_candidates = len(analyzed_candidates)
+    sorted_candidates = sorted(analyzed_candidates, key=lambda x: x["overall_score"], reverse=True)
+    avg_score = round(sum(c["overall_score"] for c in sorted_candidates) / total_candidates, 1)
+
+    return jsonify({
+        "is_batch": total_candidates > 1,
+        "total_candidates": total_candidates,
+        "average_score": avg_score,
+        "top_candidate": sorted_candidates[0]["candidate_name"],
+        "candidates": sorted_candidates,
+        # Preserve single object root structure for backward compatibility with 1 file
+        **sorted_candidates[0]
     })
 
 @app.route("/api/students", methods=["GET", "POST"])
